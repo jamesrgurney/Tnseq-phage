@@ -1,0 +1,1493 @@
+---
+title: "TN-seq phage"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+library(tidyverse)
+```
+
+This markdown doc contains the code required to make the figures in the paper on phage gene essentially and socialility called "Sociality changes gene essentiality"
+
+
+Figure 1 simple model showing where the MOI threshold is for cells to on average have more than 1 phage
+```{r}
+
+p_ge_2 <- function(moi) {
+  1 - ppois(1, lambda = moi)  # 1 - P(K <= 1)
+}
+
+# ---- Solve for MOI where P(K >= 2) = 0.5 ----
+# We solve p_ge_2(moi) - 0.5 = 0 over a reasonable interval
+threshold <- uniroot(function(m) p_ge_2(m) - 0.5, interval = c(0, 10))$root
+
+# ---- Make a curve over MOI values ----
+moi_grid <- seq(0, 6, by = 0.01)
+
+p0   <- dpois(0, lambda = moi_grid)           # P(K = 0)
+p1   <- dpois(1, lambda = moi_grid)           # P(K = 1)
+pge2 <- 1 - ppois(1, lambda = moi_grid)       # P(K >= 2)
+
+# ---- Plot the diagram ----
+plot(moi_grid, pge2, type = "l", lwd = 2,
+     xlab = "MOI (mean phage adsorptions per cell)",
+     ylab = "Fraction of cells",
+     ylim = c(0, 1),
+     main = "")
+
+# Add helpful reference curves (optional but informative)
+#lines(moi_grid, p0, lwd = 2, lty = 2)  # P(K=0)
+#lines(moi_grid, p1, lwd = 2, lty = 3)  # P(K=1)
+
+# Horizontal line at 0.5 (majority threshold)
+abline(h = 0.5, lty = 2)
+
+# Vertical line at the threshold MOI
+abline(v = threshold, lwd = 2, lty = 2)
+
+# Mark the threshold point on the P(K>=2) curve
+points(threshold, 0.5, pch = 19)
+
+# Label it
+#text(threshold+1, 0.55,
+#     labels = paste0("P(K>=2)=0.5 at MOI ≈ ", round(threshold, 3)),
+#     pos = 4)
+
+#legend("bottomright",
+#       legend = c("P(K >= 2)", "P(K = 0)", "P(K = 1)"),
+       #lty = c(1, 2, 3),
+       #lwd = 2,
+       #bty = "n")
+
+# Print the threshold value to the console too
+cat("MOI threshold where majority have >1 adsorption (P(K>=2)=0.5):",
+    threshold, "\n")
+
+
+
+```
+
+Figure 2 basic model showing social genes will increase in freq
+```{r}
+
+N_infections <- rpois(1e4, 5 * 1) # (number of cells, moi * prop of wt or KO)
+
+hist(N_infections) # yeah this is the same as the infection dynamics MOI code I had from ages ago. 
+
+
+
+simulate_simple <- function(
+    x_wt = 0.99, # preportion of non mutant at a allele 
+    moi = 1, # moi duh
+    sigma = 1,        # 0 = private, 1 = social
+    n_cells = 100000,
+    seed = 1337
+) {
+  set.seed(seed)
+  
+  x_ko <- 1 - x_wt # how many knockouts in prop to wt
+  
+  # Infection counts
+  N_wt <- rpois(n_cells, moi * x_wt)
+  N_ko <- rpois(n_cells, moi * x_ko)
+  K <- N_wt + N_ko
+  
+  infected <- K > 0
+  N_wt <- N_wt[infected]
+  N_ko <- N_ko[infected]
+  
+  # Cases
+  wt_only   <- N_wt > 0 & N_ko == 0
+  ko_only   <- N_ko > 0 & N_wt == 0
+  coinfect  <- N_wt > 0 & N_ko > 0
+  
+  # WT always produces
+  wt_progeny <- sum(wt_only) + sum(coinfect)
+  
+  # KO produces only if:
+  # - coinfected
+  # - rescued with probability sigma
+  rescued_coinfect <- rbinom(sum(coinfect), 1, sigma)
+  ko_progeny <- sum(rescued_coinfect)
+  
+  total <- wt_progeny + ko_progeny
+  
+  x_wt_next <- wt_progeny / total
+  x_ko_next <- ko_progeny / total
+  
+  c(WT = x_wt_next, KO = x_ko_next)
+}
+
+
+mois <- c(0.1, 0.5, 1, 2, 5, 10,25)
+
+res_private <- sapply(mois, function(m)
+  simulate_simple(x_wt = 0.5, moi = m, sigma = 0)["KO"]
+)
+
+res_social <- sapply(mois, function(m)
+  simulate_simple(x_wt = 0.5, moi = m, sigma = 1)["KO"]
+)
+
+plot(mois, res_private, type="b", log="x", col="red", ylim=c(0,0.6),
+     xlab="MOI", ylab="KO frequency after passage")
+lines(mois, res_social, type="b", col="blue")
+legend("topleft",
+       legend=c("Private (σ=0)", "Social (σ=1)"),
+       col=c("red","blue"), lty=1)
+
+```
+
+
+figure 3 version  with random draw of mutants 
+```{r}
+################################################################################
+# TnSeq Phage Simulation 
+#
+# This code takes 99 genes assigns them a random fitness score, drawn from a bounded uniform distribution
+# and a random complementation score (0 being no complementation can happen and 1 being a gene is full complemented in the preseance of another). 
+# currently if outputs multiple figures, only p2 is going into the paper I think.
+#
+################################################################################
+
+library(tidyverse)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. GENE PARAMETER TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+set.seed(42)
+
+n_genes <- 375
+
+gene_params <- tibble(
+  gene_id = paste0("gene_", sprintf("%02d", 1:n_genes)),
+
+  # True fitness effect of disruption (0 = lethal, 1 = fully neutral)
+  fitness_effect = c(
+    runif(n_genes/3, 0.00, 0.05),   # essential genes
+    runif(n_genes/3, 0.40, 0.60),   # moderate-effect genes
+    runif(n_genes/3, 0.70, 1.00)    # near-neutral genes
+  ) %>% sample(),
+
+  # Complementation fraction: how much fitness is rescued when a co-infecting
+  # phage supplies a functional copy of this gene
+  # 0 = not complementable (cis-acting)
+  # 1 = fully complementable (trans or diffusible enzyme)
+  complementation = c(
+    runif(n_genes/3, 0.00, 0.10),
+    runif(n_genes/3, 0.40, 0.80),
+    runif(n_genes/3, 0.85, 1.00)
+  ) %>% sample()
+)
+
+print(gene_params, n = 375) # does this look right?
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. HELPER: COUNT FUNCTIONAL CO-INFECTORS FOR A GIVEN GENE
+# ─────────────────────────────────────────────────────────────────────────────
+
+#' Given a vector of co-infecting phage gene disruptions, count how many
+#' are functional (i.e. NOT disrupted) at the focal gene.
+#'
+#' @param focal_gene      Integer: which gene the focal mutant is disrupted in
+#' @param coinfector_genes Integer vector: which gene each co-infector is disrupted in
+#' @return Integer: number of co-infectors that can complement focal_gene
+
+count_helpers <- function(focal_gene, coinfector_genes) {
+  sum(coinfector_genes != focal_gene)
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. FITNESS OF ONE PHAGE
+# ─────────────────────────────────────────────────────────────────────────────
+
+#' Calculate relative phage output for one mutant phage in one cell
+#'
+#' @param focal_gene      Which gene is disrupted in the focal phage
+#' @param n_helpers       Number of co-infectors that are WT at focal_gene
+#' @param gene_params     Gene parameter tibble
+#' @return Relative phage output (0–1)
+# this is bad to name to style params the same but this wont be a package so it is fine.
+
+phage_output <- function(focal_gene, n_helpers, gene_params) {
+  gp          <- gene_params[focal_gene, ] #
+  intrinsic   <- gp$fitness_effect
+
+  if (n_helpers == 0) {
+    return(intrinsic)
+  } else {
+    # At least one helper present: rescue fitness proportional to complementation
+    rescued <- intrinsic + gp$complementation * (1 - intrinsic)
+    return(rescued)
+  }
+}
+
+# to break this function down, if there isn't another phage present then you return the fitness effect
+# if there is then you get the else statement which is the rescued call.
+# as an example lets say you have mutation that results in a low fitness alone of 0.2 but if theres another phage there then you get a compl score of 0.8. this results in a final fitness effect of 0.68 
+#0.2 + 0.8 * (0.8-0.2)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. CORE SIMULATION — SATURATED MUTANT LIBRARY
+# ─────────────────────────────────────────────────────────────────────────────
+
+#' Simulate one TnSeq experiment with a saturated mutant library
+#'
+#' Every phage carries an insertion in one randomly chosen gene.
+#' Co-infecting phages can complement a focal mutant only if their insertion
+#' is in a DIFFERENT gene.
+#'
+#' @param moi          Mean MOI — average number of phages per bacterium (Poisson)
+#' @param n_bacteria   Number of bacteria in the infection
+#' @param burst_size   Mean WT burst size (Poisson-distributed output per cell)
+#' @param gene_params  Gene parameter tibble
+#' @param seed         Random seed
+#' @return Tibble with per-gene estimated fitness scores
+
+#so this is just getting the function ready. The main simulation will have a range of MOIS
+simulate_tnseq_v1b <- function(moi          = 1,
+                                n_bacteria   = 2e5,
+                                burst_size   = 50,
+                                gene_params  = gene_params,
+                                seed         = NULL) {
+
+  if (!is.null(seed)) set.seed(seed)
+  n_genes <- nrow(gene_params)
+
+  # Track input and output counts per gene
+  input_counts  <- numeric(n_genes)
+  output_counts <- numeric(n_genes)
+
+  # Draw number of phages per cell from Poisson(MOI)
+  phages_per_cell <- rpois(n_bacteria, lambda = moi)
+  phages_per_cell <- phages_per_cell[phages_per_cell > 0]
+  n_infected      <- length(phages_per_cell)
+
+  for (cell in seq_len(n_infected)) {
+    n_phage <- phages_per_cell[cell]
+
+    # Every phage has an insertion — draw which gene for each phage
+    # Uniform across all genes (can be made non-uniform)
+    cell_genes <- sample(n_genes, n_phage, replace = TRUE)
+
+    # Each phage is the "focal" mutant in turn; the rest are co-infectors
+    for (p in seq_len(n_phage)) {
+      focal_gene      <- cell_genes[p]
+      coinfector_genes <- cell_genes[-p]
+
+      input_counts[focal_gene] <- input_counts[focal_gene] + 1
+
+      # How many co-infectors are WT at the focal gene?
+      n_helpers <- count_helpers(focal_gene, coinfector_genes)
+
+      # Relative fitness
+      rel_fitness <- phage_output(focal_gene, n_helpers, gene_params)
+
+      # Stochastic burst proportional to fitness, does this work...?
+      actual_output <- rpois(1, lambda = rel_fitness * burst_size)
+
+      output_counts[focal_gene] <- output_counts[focal_gene] + actual_output
+    }
+  }
+
+  # ── Estimate fitness score ──────────────────────────────────────────────────
+  pseudo          <- 1
+  log2_ratio      <- log2((output_counts + pseudo) / (input_counts + pseudo))
+
+  # We normalize reads, do we need to do it here? Lets try normalize to median of near-neutral genes
+  neutral_idx     <- which(gene_params$fitness_effect > 0.7)
+  log2_ratio_norm <- log2_ratio - median(log2_ratio[neutral_idx]) #log2 median normalization 
+
+  tibble(
+    gene_id         = gene_params$gene_id,
+    true_fitness    = gene_params$fitness_effect,
+    complementation = gene_params$complementation,
+    input_counts    = input_counts,
+    output_counts   = output_counts,
+    log2_ratio      = log2_ratio,
+    fitness_score   = log2_ratio_norm,
+    moi             = moi
+  )
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. ANALYTICAL EXPECTATION: P(at least one helper) given MOI and n_genes
+# ─────────────────────────────────────────────────────────────────────────────
+
+#' For a focal phage disrupted in gene X, what is the probability that at
+#' least one co-infecting phage is WT at gene X?
+#'
+#' Each co-infector independently has probability (1 - 1/n_genes) of being
+#' WT at gene X (i.e. its insertion is somewhere else).
+#' The number of co-infectors given the focal phage is already in the cell
+#' follows a Poisson(MOI) distribution (approximately).
+#'
+#' P(at least one helper) = 1 - P(no helpers)
+#'   = 1 - sum_{k=0}^{inf} P(k co-infectors) * (1/n_genes)^k
+#'   = 1 - exp(-MOI * (1 - 1/n_genes))   [Poisson pgf result]
+
+# below helps us work out the rate at which the same gene is broken with x infecting phages
+# maybe interesting maybe not but by definition that means that smaller genomes are more likely to have the same knock out.
+
+p_at_least_one_helper <- function(moi, n_genes) {
+  p_same_gene <- 1 / n_genes
+  1 - exp(-moi * (1 - p_same_gene))
+}
+
+# If intuition isn't clear, lets make a table with more and more genes and ask how the rate of helpers changes in response to phage genome size and moi 
+helper_prob_table <- expand_grid(
+  moi     = c(0.1, 0.5, 1, 2, 5, 10),
+  n_genes = c(10, 20, 40, 80, 160, 320)
+) %>%
+  mutate(p_helper = p_at_least_one_helper(moi, n_genes))
+
+cat("\nP(at least one helper co-infector) by MOI and genome complexity:\n")
+helper_prob_table %>%
+  pivot_wider(names_from = n_genes, values_from = p_helper,
+              names_prefix = "n_genes=") %>%
+  print()
+
+# its not a big effect but as you insrease the number of genes the % incrases that a phage doesnt have the same mutation as you. This is all a bit of a distraction but worth noting. 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. RUN SIMULATION ACROSS MOIs
+# ─────────────────────────────────────────────────────────────────────────────
+
+# now we can use the simulate_tn-seq function we got earlier. This will take a min or two to run.
+
+moi_values <- c(0.01, 0.1, 0.5, 1, 2, 5, 10)
+
+
+cat("\nRunning simulations...\n")
+results_all <- map_dfr(moi_values, function(m) {
+  cat("  MOI =", m, "\n")
+  simulate_tnseq_v1b(
+    moi         = m,
+    n_bacteria  = 2e5,
+    burst_size  = 50,
+    gene_params = gene_params,
+    seed        = 123
+  )
+})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. VISUALIZATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+results_all <- results_all %>%
+  mutate(
+    gene_class = case_when(
+      true_fitness < 0.1  ~ "Essential",
+      true_fitness < 0.6  ~ "Moderate",
+      TRUE                ~ "Near-neutral"
+    ),
+    comp_class = case_when(
+      complementation < 0.2 ~ "Low comp.",
+      complementation < 0.7 ~ "Moderate comp.",
+      TRUE                  ~ "High comp."
+    )
+  )
+
+# ── Plot 1: Fitness score vs MOI, faceted by gene class ──────────────────────
+p1 <- ggplot(results_all,
+             aes(x = factor(moi), y = fitness_score,
+                 color = gene_class, group = gene_id)) +
+  geom_line(alpha = 0.5, linewidth = 0.6) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_wrap(~gene_class) +
+  scale_color_manual(values = c(Essential    = "#d62728",
+                                Moderate     = "#ff7f0e",
+                                "Near-neutral" = "#2ca02c")) +
+  labs(
+    title    = "TnSeq Fitness Score vs MOI — Saturated Mutant Library",
+    subtitle = "Every phage carries a unique insertion; co-infectors complement only if disrupted in a different gene",
+    x        = "MOI",
+    y        = "Normalized log2(output / input)",
+    color    = "Gene class"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p1)
+#ggsave("tnseq_v1b_fitness_vs_moi.pdf", p1, width = 10, height = 5)
+
+
+# ── Plot 2: Essential genes — complementation rescue vs MOI ──────────────────
+p2 <- results_all %>%
+  filter(gene_class == "Essential") %>%
+  ggplot(aes(x = factor(moi), y = fitness_score,
+             color = complementation, group = gene_id)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  scale_color_viridis_c(name = "Complementation\nFraction", option = "plasma") +
+  #geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = "Essential Genes: Apparent Fitness vs MOI",
+    # subtitle = "complementable genes increase in abundance with high MOI",
+    x        = "MOI",
+    y        = "Normalized log2 abundance"
+  ) +
+  theme_bw(base_size = 12)
+
+print(p2)
+#ggsave("tnseq_v1b_essential_genes.pdf", p2, width = 8, height = 5)
+
+
+# ── Plot 3: Analtical helper probability overlaid on simulation ──────────────
+# Average fitness score of essential genes vs MOI alongside P(helper)
+# I dont like thi plot.  
+
+# essential_summary <- results_all %>%
+#   filter(gene_class == "Essential") %>%
+#   group_by(moi) %>%
+#   summarise(mean_fitness_score = mean(fitness_score), .groups = "drop") %>%
+#   mutate(p_helper = p_at_least_one_helper(moi, n_genes = 40))
+# 
+# # #p3 <- ggplot(essential_summary, aes(x = moi)) +
+# #   geom_line(aes(y = mean_fitness_score, color = "Mean fitness score (essential genes)"),
+# #             linewidth = 1.2) +
+# #   geom_point(aes(y = mean_fitness_score, color = "Mean fitness score (essential genes)"),
+# #              size = 3) +
+# #   geom_line(aes(y = p_helper * max(abs(mean_fitness_score)) * -1,
+# #                 color = "P(at least one helper) [scaled]"),
+# #             linewidth = 1.2, linetype = "dashed") +
+# #   geom_point(aes(y = p_helper * max(abs(mean_fitness_score)) * -1,
+# #                  color = "P(at least one helper) [scaled]"), size = 3) +
+# #   scale_color_manual(values = c(
+# #     "Mean fitness score (essential genes)" = "#d62728",
+# #     "P(at least one helper) [scaled]"      = "#377eb8"
+# #   )) +
+# #   labs(
+# #     title    = "Complementation Probability Drives MOI Artifact",
+# #     # subtitle = "As MOI rises, P(helper present) increases, inflating essential gene scores",
+# #     x        = "MOI",
+# #     y        = "Value (fitness score)",
+# #     color    = NULL
+# #   ) +
+# #   theme_bw(base_size = 12) +
+# #   theme(legend.position = "bottom")
+# # 
+# # #print(p3)
+# # ggsave("tnseq_v1b_helper_probability.pdf", p3, width = 8, height = 5)
+# # 
+# 
+# # ── Plot 4: True vs estimated fitness at three MOIs ───────────────────────────
+# p4 <- results_all %>%
+#   filter(moi %in% c(0.1, 1, 5)) %>%
+#   mutate(moi_label = paste0("MOI = ", moi)) %>%
+#   ggplot(aes(x = true_fitness, y = fitness_score,
+#              color = complementation, shape = gene_class)) +
+#   geom_point(size = 2.5, alpha = 0.85) +
+#   geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.8) +
+#   facet_wrap(~moi_label) +
+#   scale_color_viridis_c(name = "Complementation", option = "plasma") +
+#   scale_shape_manual(values = c(Essential = 17, Moderate = 16, "Near-neutral" = 1)) +
+#   labs(
+#     title    = "True vs Estimated Fitness at Different MOIs",
+#     subtitle = "Score compression at high MOI is strongest for high-complementation genes",
+#     x        = "True fitness (simulation parameter)",
+#     y        = "Estimated fitness score",
+#     shape    = "Gene class"
+#   ) +
+#   theme_bw(base_size = 12)
+# 
+# print(p4)
+# ggsave("tnseq_v1b_true_vs_estimated.pdf", p4, width = 11, height = 4)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. SUMMARY STATISTICS
+# ─────────────────────────────────────────────────────────────────────────────
+# 
+# dont really need these but they might be usful diagnostics. 
+
+# cat("\n══════════════════════════════════════════════════════\n")
+# cat("Correlation: true fitness vs estimated fitness score\n")
+# cat("══════════════════════════════════════════════════════\n")
+# 
+# results_all %>%
+#   group_by(moi) %>%
+#   summarise(
+#     pearson_r    = round(cor(true_fitness, fitness_score, method = "pearson"),  3),
+#     spearman_rho = round(cor(true_fitness, fitness_score, method = "spearman"), 3),
+#     .groups = "drop"
+#   ) %>%
+#   print()
+# 
+# cat("\n══════════════════════════════════════════════════════\n")
+# cat("Mean fitness score for essential genes by MOI\n")
+# cat("══════════════════════════════════════════════════════\n")
+# 
+# results_all %>%
+#   filter(gene_class == "Essential") %>%
+#   group_by(moi) %>%
+#   summarise(
+#     mean_score = round(mean(fitness_score), 3),
+#     sd_score   = round(sd(fitness_score),   3),
+#     .groups    = "drop"
+#   ) %>%
+#   print()
+```
+
+Figure 4 compartment split model with random draw. 
+
+```{r}
+################################################################################
+# TnSeq Phage Simulation - : Compartmentalized Life Cycle + Saturated Mutant Library
+#
+#
+# Life cycle stages (33 genes each):
+#   1. ADSORPTION   — gene disruption = phage never enters the cell.
+#                     Complementation always 0 (cis requirement, pre-entry).
+#
+#   2. REPLICATION  — intracellular; products are diffusible.
+#                     Co-infectors can complement if WT at this gene.
+#
+#   3. EXIT (lysis) — assembly and release.
+#                     Partial complementation only (cap at 0.7): some
+#                     structural genes must be cis-encoded for packaging.
+################################################################################
+
+library(tidyverse)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. GENE PARAMETER TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+set.seed(42)
+
+n_genes <- 99
+
+# 33 genes per stage
+stage_assignment <- c(
+  rep("adsorption",  33),
+  rep("replication", 33),
+  rep("exit",        33)
+)
+
+gene_params <- tibble(
+  gene_id = paste0("gene_", sprintf("%03d", 1:n_genes)),
+  stage   = sample(stage_assignment),   # shuffle so stage isn't confounded with gene order
+
+  # True fitness effect of disruption (0 = lethal, 1 = fully neutral)
+  # Equal thirds: 33 essential, 33 moderate, 33 near-neutral
+  fitness_effect = c(
+    runif(33, 0.00, 0.10),   # 33 essential
+    runif(33, 0.10, 0.60),   # 33 moderate
+    runif(33, 0.70, 1.00)    # 33 near-neutral
+  ) %>% sample(),
+
+  # Raw complementation drawn in equal thirds before stage constraint applied
+  complementation_raw = c(
+    runif(33, 0.00, 0.10),   # 33 low complementation
+    runif(33, 0.40, 0.80),   # 33 moderate complementation
+    runif(33, 0.85, 1.00)    # 33 high complementation
+  ) %>% sample()
+
+) %>%
+  mutate(
+    # Stage constrains realised complementation:
+    #   adsorption  → always 0 (phage never entered, no trans-complementation possible)
+    #   replication → full range allowed
+    #   exit        → capped at 0.7 (some structural genes need cis encoding)
+    complementation = case_when(
+      stage == "adsorption"  ~ 0,
+      stage == "replication" ~ complementation_raw,
+      stage == "exit"        ~ complementation_raw * 0.7
+    )
+  ) %>%
+  select(-complementation_raw)
+
+cat("Gene stage distribution:\n")
+print(table(gene_params$stage))
+
+cat("\nEssentiality distribution:\n")
+print(table(cut(gene_params$fitness_effect,
+               breaks = c(0, 0.1, 0.6, 1),
+               labels = c("Essential", "Moderate", "Near-neutral"),
+               include.lowest = TRUE)))
+
+cat("\nGene parameters (first 15 rows):\n")
+print(gene_params, n = 15)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. STAGE-AWARE LIFE CYCLE FITNESS FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+#' Calculate relative phage output for one mutant phage in one cell.
+#'
+#' Helper counting is stage-aware:
+#'   - Adsorption gene mutant: cannot be complemented regardless of co-infectors.
+#'   - Replication / exit gene mutant: helpers are co-infectors whose insertion
+#'     is in a DIFFERENT gene (they carry a functional copy of the focal gene).
+#'
+#' @param focal_gene       Integer row index of the disrupted gene
+#' @param n_helpers        Number of co-infectors WT at the focal gene
+#'                         (pre-computed outside this function)
+#' @param gene_params      Gene parameter tibble
+#' @return Relative phage output (0–1)
+
+phage_lifecycle <- function(focal_gene, n_helpers, gene_params) {
+
+  gp          <- gene_params[focal_gene, ]
+  intrinsic   <- gp$fitness_effect
+  has_helper  <- n_helpers > 0
+
+  if (gp$stage == "adsorption") {
+    # Phage cannot enter cell — no complementation possible regardless of MOI
+    return(intrinsic)
+  }
+
+  if (gp$stage == "replication") {
+    if (has_helper) {
+      return(intrinsic + gp$complementation * (1 - intrinsic))
+    } else {
+      return(intrinsic)
+    }
+  }
+
+  if (gp$stage == "exit") {
+    # Assume replication succeeded (exit gene disruption doesn't block replication)
+    if (has_helper) {
+      return(intrinsic + gp$complementation * (1 - intrinsic))
+    } else {
+      return(intrinsic)
+    }
+  }
+
+  return(1.0)  # fallback
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. ANALYTICAL HELPER PROBABILITY
+# ─────────────────────────────────────────────────────────────────────────────
+
+#' P(at least one co-infector is WT at the focal gene)
+#' given Poisson MOI and uniform insertion distribution across n_genes.
+#'
+#' Each co-infector has probability (1 - 1/n_genes) of being WT at focal gene.
+#' Result from Poisson probability generating function:
+#'   P(at least one helper) = 1 - exp(-MOI * (1 - 1/n_genes))
+#'
+#' Note: adsorption genes are excluded — this probability is only meaningful
+#' for replication and exit genes.
+
+p_at_least_one_helper <- function(moi, n_genes) {
+  1 - exp(-moi * (1 - 1 / n_genes))
+}
+
+cat("\nP(at least one helper) for replication/exit genes | n_genes = 99:\n")
+tibble(moi = c(0.1, 0.5, 1, 2, 5, 10)) %>%
+  mutate(p_helper = round(p_at_least_one_helper(moi, n_genes = 99), 3)) %>%
+  print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. CORE SIMULATION — SATURATED MUTANT LIBRARY
+# ─────────────────────────────────────────────────────────────────────────────
+
+#' Simulate one TnSeq experiment
+#'
+#' Every phage carries an insertion in one randomly chosen gene (saturated library).
+#' For each focal mutant phage in a cell, helpers are co-infecting phages whose
+#' insertion is in a DIFFERENT gene — they supply a functional copy of the focal gene.
+#' Adsorption mutants receive no benefit from co-infectors.
+#'
+#' @param moi          Mean MOI (Poisson lambda)
+#' @param n_bacteria   Number of bacteria
+#' @param burst_size   Mean WT burst size
+#' @param gene_params  Gene parameter tibble
+#' @param seed         Random seed
+#' @return Tibble with per-gene TnSeq fitness estimates
+
+simulate_tnseq_v2b <- function(moi         = 1,
+                                n_bacteria  = 2e5,
+                                burst_size  = 50,
+                                gene_params = gene_params,
+                                seed        = NULL) {
+
+  if (!is.null(seed)) set.seed(seed)
+  n_genes <- nrow(gene_params)
+
+  input_counts  <- numeric(n_genes)
+  output_counts <- numeric(n_genes)
+
+  # Draw phages per cell
+  phages_per_cell <- rpois(n_bacteria, lambda = moi)
+  phages_per_cell <- phages_per_cell[phages_per_cell > 0]
+  n_infected      <- length(phages_per_cell)
+
+  for (cell in seq_len(n_infected)) {
+    n_phage <- phages_per_cell[cell]
+
+    # Every phage has an insertion — assign each to a random gene
+    cell_genes <- sample(n_genes, n_phage, replace = TRUE)
+
+    for (p in seq_len(n_phage)) {
+      focal_gene       <- cell_genes[p]
+      coinfector_genes <- cell_genes[-p]
+
+      input_counts[focal_gene] <- input_counts[focal_gene] + 1
+
+      # Count co-infectors that are WT at the focal gene
+      # (adsorption gene: n_helpers is computed but ignored inside phage_lifecycle)
+      n_helpers <- sum(coinfector_genes != focal_gene)
+
+      rel_fitness   <- phage_lifecycle(focal_gene, n_helpers, gene_params)
+      actual_output <- rpois(1, lambda = max(rel_fitness * burst_size, 1e-9))
+
+      output_counts[focal_gene] <- output_counts[focal_gene] + actual_output
+    }
+  }
+
+  # Estimate fitness score
+  pseudo          <- 1
+  log2_ratio      <- log2((output_counts + pseudo) / (input_counts + pseudo))
+  neutral_idx     <- which(gene_params$fitness_effect > 0.7)
+  log2_ratio_norm <- log2_ratio - median(log2_ratio[neutral_idx])
+
+  tibble(
+    gene_id         = gene_params$gene_id,
+    stage           = gene_params$stage,
+    true_fitness    = gene_params$fitness_effect,
+    complementation = gene_params$complementation,
+    input_counts    = input_counts,
+    output_counts   = output_counts,
+    log2_ratio      = log2_ratio,
+    fitness_score   = log2_ratio_norm,
+    moi             = moi
+  )
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. RUN ACROSS MOIs
+# ─────────────────────────────────────────────────────────────────────────────
+
+moi_values <- c(0.1, 0.5, 1, 2, 5, 10)
+
+cat("\nRunning simulations...\n")
+results_all <- map_dfr(moi_values, function(m) {
+  cat("  MOI =", m, "\n")
+  simulate_tnseq_v2b(
+    moi         = m,
+    n_bacteria  = 2e5,
+    burst_size  = 50,
+    gene_params = gene_params,
+    seed        = 99
+  )
+})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. VISUALIZATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+results_all <- results_all %>%
+  mutate(
+    essentiality = case_when(
+      true_fitness < 0.1  ~ "Essential",
+      true_fitness < 0.6  ~ "Moderate",
+      TRUE                ~ "Near-neutral"
+    ),
+    stage = factor(stage, levels = c("adsorption", "replication", "exit"))
+  )
+
+stage_colors <- c(adsorption  = "#e41a1c",
+                  replication = "#377eb8",
+                  exit        = "#4daf4a")
+
+# ── Plot 1: Fitness score vs MOI, faceted by stage × essentiality ────────────
+p1 <- results_all %>%
+  #filter(essentiality != "Near-neutral") %>%
+  ggplot(aes(x = factor(moi), y = fitness_score,
+             color = stage, group = gene_id)) +
+  geom_line(alpha = 0.45, linewidth = 0.5) +
+  geom_point(alpha = 0.65, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_grid(essentiality ~ stage) +
+  scale_color_manual(values = stage_colors) +
+  labs(
+    title    = "TnSeq Fitness Score vs MOI — Compartmentalized Life Cycle (Saturated Library)",
+    subtitle = "Essential and moderate genes; each line = one gene tracked across MOIs",
+    x        = "MOI",
+    y        = "Normalized log2(output / input)",
+    color    = "Life cycle stage"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+
+print(p1)
+ggsave("tnseq_v2b_fitness_by_stage_moi.pdf", p1, width = 11, height = 7)
+
+
+# ── Plot 2: Essential genes only — color by complementation ──────────────────
+p2 <- results_all %>%
+  filter(essentiality == "Essential") %>%
+  ggplot(aes(x = factor(moi), y = fitness_score,
+             color = complementation, group = gene_id)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.2) +
+  facet_wrap(~stage, nrow = 1) +
+  scale_color_viridis_c(name = "Complementation\nFraction", option = "plasma") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = "Essential Genes: Apparent Fitness vs MOI by Stage",
+    subtitle = "Adsorption genes flat regardless of MOI; replication/exit genes rescued if complementable",
+    x        = "MOI",
+    y        = "Normalized log2(output / input)"
+  ) +
+  theme_bw(base_size = 11)
+
+print(p2)
+ggsave("tnseq_v2b_essential_by_stage.pdf", p2, width = 11, height = 5)
+
+
+# ── Plot 3: True vs estimated fitness at MOI 0.1, 1, 5 ───────────────────────
+p3 <- results_all %>%
+  filter(moi %in% c(0.1, 1, 5)) %>%
+  mutate(moi_label = paste0("MOI = ", moi)) %>%
+  ggplot(aes(x = true_fitness, y = fitness_score,
+             color = stage, shape = essentiality)) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, color = "black",
+              linewidth = 0.7, aes(group = moi_label)) +
+  facet_wrap(~moi_label, nrow = 1) +
+  scale_color_manual(values = stage_colors) +
+  scale_shape_manual(values = c(Essential = 17, Moderate = 16, "Near-neutral" = 1)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  labs(
+    title    = "True vs Estimated Fitness — Saturated Library",
+    subtitle = "Score compression at high MOI; adsorption genes (red) unaffected",
+    x        = "True fitness (simulation parameter)",
+    y        = "Estimated fitness score (normalized log2 ratio)",
+    color    = "Stage", shape = "Essentiality"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "right")
+
+print(p3)
+ggsave("tnseq_v2b_true_vs_estimated.pdf", p3, width = 13, height = 5)
+
+
+# ── Plot 4: Heatmap — all 99 genes × all MOIs ────────────────────────────────
+heat_data <- results_all %>%
+  arrange(stage, true_fitness) %>%
+  mutate(gene_id = factor(gene_id, levels = unique(gene_id)))
+
+p4 <- ggplot(heat_data, aes(x = factor(moi), y = gene_id, fill = fitness_score)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  scale_fill_gradient2(low = "#d73027", mid = "white", high = "#1a9641",
+                       midpoint = 0, name = "Fitness\nScore") +
+  facet_grid(stage ~ ., scales = "free_y", space = "free") +
+  labs(
+    title    = "TnSeq Fitness Scores: All 99 Genes × All MOIs",
+    subtitle = "Sorted within stage by true fitness (most essential = top of each panel)",
+    x        = "MOI",
+    y        = "Gene"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    axis.text.y      = element_text(size = 5),
+    strip.text.y     = element_text(angle = 0, face = "bold"),
+    legend.position  = "right"
+  )
+
+print(p4)
+ggsave("tnseq_v2b_heatmap.pdf", p4, width = 9, height = 14)
+
+
+# ── Plot 5: Analytical helper probability by MOI — adsorption excluded ────────
+helper_curve <- tibble(moi = seq(0.1, 10, by = 0.1)) %>%
+  mutate(p_helper = p_at_least_one_helper(moi, n_genes = 99))
+
+# Overlay mean fitness score of essential replication + exit genes
+essential_rep_exit <- results_all %>%
+  filter(essentiality == "Essential", stage != "adsorption") %>%
+  group_by(moi) %>%
+  summarise(mean_score = mean(fitness_score), .groups = "drop")
+
+p5 <- ggplot() +
+  geom_line(data = helper_curve,
+            aes(x = moi, y = p_helper, linetype = "P(helper present)"),
+            color = "#377eb8", linewidth = 1.2) +
+  geom_line(data = essential_rep_exit,
+            aes(x = moi, y = (mean_score - min(mean_score)) /
+                  (max(mean_score) - min(mean_score)),
+                linetype = "Essential rep/exit score\n(scaled 0–1)"),
+            color = "#e41a1c", linewidth = 1.2) +
+  geom_point(data = essential_rep_exit,
+             aes(x = moi, y = (mean_score - min(mean_score)) /
+                   (max(mean_score) - min(mean_score))),
+             color = "#e41a1c", size = 3) +
+  scale_linetype_manual(values = c("P(helper present)" = "solid",
+                                   "Essential rep/exit score\n(scaled 0–1)" = "dashed"),
+                        name = NULL) +
+  labs(
+    title    = "Complementation Probability Drives the MOI Artifact",
+    subtitle = "P(helper present) rises with MOI, inflating apparent fitness of essential replication/exit genes",
+    x        = "MOI",
+    y        = "Scaled value (0–1)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p5)
+ggsave("tnseq_v2b_helper_probability.pdf", p5, width = 8, height = 5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. SUMMARY STATISTICS
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("\n══════════════════════════════════════════════════════════════\n")
+cat("Correlation: true fitness vs estimated fitness score by stage\n")
+cat("══════════════════════════════════════════════════════════════\n")
+
+results_all %>%
+  group_by(moi, stage) %>%
+  summarise(
+    pearson_r    = round(cor(true_fitness, fitness_score, method = "pearson"),  3),
+    spearman_rho = round(cor(true_fitness, fitness_score, method = "spearman"), 3),
+    n_genes      = n(),
+    .groups      = "drop"
+  ) %>%
+  print(n = 30)
+
+cat("\n══════════════════════════════════════════════════════════════\n")
+cat("Mean fitness score for ESSENTIAL genes by stage and MOI\n")
+cat("══════════════════════════════════════════════════════════════\n")
+
+results_all %>%
+  filter(essentiality == "Essential") %>%
+  group_by(moi, stage) %>%
+  summarise(mean_score = round(mean(fitness_score), 3), .groups = "drop") %>%
+  pivot_wider(names_from = stage, values_from = mean_score) %>%
+  print()
+```
+
+figure 5
+```{r}
+################################################################################
+# TnSeq Phage Simulation: Two-Round Infection
+#
+# Experimental design:
+#   ROUND 1 — Standard TnSeq infection at a defined MOI.
+#             Co-infection is common; complementation can mask fitness defects.
+#             Produces an output phage pool with altered gene frequencies.
+#
+#   ROUND 2 — Each phage from the Round 1 output pool infects a new host ALONE
+#             (effective MOI → 0; single phage per cell, no co-infectors).
+#             No complementation possible. Fitness is purely intrinsic.
+#             Produces a second output pool.
+#
+# This design separates:
+#   - GLOBAL competition  : overall frequency change across both rounds
+#   - LOCAL competition   : within-cell complementation in Round 1 only
+#   - COMPLEMENTATION MASK: genes that appeared neutral in Round 1 because they
+#                           were rescued, but crash in Round 2 when isolated
+#
+# The key metric is the DELTA score:
+#   delta = fitness_score_round2 - fitness_score_round1
+#   Negative delta → gene was being complemented/rescued in Round 1
+#   Near-zero delta → gene fitness is MOI-independent (adsorption genes,
+#                     or genuinely neutral genes)
+#
+# Population structure notes:
+#   - Round 1 output pool frequencies are the Round 2 INPUT frequencies.
+#     Mutants that were rescued in Round 1 enter Round 2 at HIGHER frequency
+#     than their intrinsic fitness warrants — this amplifies the Round 2 crash.
+#   - Adsorption mutants: fail at same rate in both rounds (no MOI effect),
+#     so delta ≈ 0. Distinguishable from complemented replication/exit mutants.
+################################################################################
+
+library(tidyverse)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. GENE PARAMETER TABLE  (identical to v2b)
+# ─────────────────────────────────────────────────────────────────────────────
+
+set.seed(42)
+
+n_genes <- 99
+
+stage_assignment <- c(
+  rep("adsorption",  33),
+  rep("replication", 33),
+  rep("exit",        33)
+)
+
+gene_params <- tibble(
+  gene_id = paste0("gene_", sprintf("%03d", 1:n_genes)),
+  stage   = sample(stage_assignment),
+
+  fitness_effect = c(
+    runif(33, 0.00, 0.10),
+    runif(33, 0.10, 0.60),
+    runif(33, 0.70, 1.00)
+  ) %>% sample(),
+
+  complementation_raw = c(
+    runif(33, 0.00, 0.10),
+    runif(33, 0.40, 0.80),
+    runif(33, 0.85, 1.00)
+  ) %>% sample()
+
+) %>%
+  mutate(
+    complementation = case_when(
+      stage == "adsorption"  ~ 0,
+      stage == "replication" ~ complementation_raw,
+      stage == "exit"        ~ complementation_raw
+    )
+  ) %>%
+  select(-complementation_raw)
+
+cat("Gene stage distribution:\n")
+print(table(gene_params$stage))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. LIFE CYCLE FITNESS FUNCTION  (unchanged from v2b)
+# ─────────────────────────────────────────────────────────────────────────────
+
+phage_lifecycle <- function(focal_gene, n_helpers, gene_params) {
+  gp         <- gene_params[focal_gene, ]
+  intrinsic  <- gp$fitness_effect
+  has_helper <- n_helpers > 0
+
+  # -- Adsorption: never complemented -----------------------------------------
+  if (gp$stage == "adsorption") return(intrinsic)
+
+  # -- Replication: complementable by co-infectors ----------------------------
+  if (gp$stage == "replication") {
+    if (has_helper) {
+      return(intrinsic + gp$complementation * (1 - intrinsic))
+    } else {
+      return(intrinsic)
+    }
+  }
+
+  # -- Exit: phage alone cannot release progeny -- burst goes to zero ----------
+  # Biology: even if the genome replicates normally, without functional exit
+  # machinery the cell never lyses and no progeny are released.
+  # A co-infector can supply exit products in trans (up to complementation limit).
+  if (gp$stage == "exit") {
+    if (!has_helper) return(0)
+    return(intrinsic + gp$complementation * (1 - intrinsic))
+  }
+
+  return(1.0)  # fallback
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. SINGLE-ROUND SIMULATION ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+#' Run one round of infection.
+#'
+#' Input is either a flat saturated library (Round 1) or a frequency-weighted
+#' pool from the previous round's output (Round 2+).
+#'
+#' @param moi              Mean MOI for this round (Poisson lambda)
+#' @param n_bacteria       Number of bacteria
+#' @param burst_size       Mean WT burst size
+#' @param gene_params      Gene parameter tibble
+#' @param input_freq       Named numeric vector of relative input frequencies
+#'                         per gene (length n_genes, sums to 1).
+#'                         If NULL, assumes uniform (saturated library).
+#' @param seed             Random seed
+#' @return List with:
+#'   $results   tibble of per-gene counts and scores
+#'   $output_freq  named vector of output frequencies (for chaining rounds)
+
+run_infection_round <- function(moi         = 1,
+                                n_bacteria  = 2e5,
+                                burst_size  = 50,
+                                gene_params = gene_params,
+                                input_freq  = NULL,
+                                seed        = NULL) {
+
+  if (!is.null(seed)) set.seed(seed)
+  n_genes <- nrow(gene_params)
+
+  # Default: uniform input frequencies (saturated library)
+  if (is.null(input_freq)) {
+    input_freq <- rep(1 / n_genes, n_genes)
+  }
+  input_freq <- input_freq / sum(input_freq)  # ensure normalised
+
+  input_counts  <- numeric(n_genes)
+  output_counts <- numeric(n_genes)
+
+  phages_per_cell <- rpois(n_bacteria, lambda = moi)
+  phages_per_cell <- phages_per_cell[phages_per_cell > 0]
+  n_infected      <- length(phages_per_cell)
+
+  for (cell in seq_len(n_infected)) {
+    n_phage    <- phages_per_cell[cell]
+    cell_genes <- sample(n_genes, n_phage, replace = TRUE, prob = input_freq)
+
+    for (p in seq_len(n_phage)) {
+      focal_gene       <- cell_genes[p]
+      coinfector_genes <- cell_genes[-p]
+
+      input_counts[focal_gene] <- input_counts[focal_gene] + 1
+
+      n_helpers     <- sum(coinfector_genes != focal_gene)
+      rel_fitness   <- phage_lifecycle(focal_gene, n_helpers, gene_params)
+      actual_output <- rpois(1, lambda = max(rel_fitness * burst_size, 1e-9))
+
+      output_counts[focal_gene] <- output_counts[focal_gene] + actual_output
+    }
+  }
+
+  # Fitness score
+  pseudo          <- 1
+  log2_ratio      <- log2((output_counts + pseudo) / (input_counts + pseudo))
+  neutral_idx     <- which(gene_params$fitness_effect > 0.7)
+  log2_ratio_norm <- log2_ratio - median(log2_ratio[neutral_idx])
+
+  # Output frequencies for chaining into next round
+  output_freq <- (output_counts + pseudo) / sum(output_counts + pseudo)
+
+  results <- tibble(
+    gene_id         = gene_params$gene_id,
+    stage           = gene_params$stage,
+    true_fitness    = gene_params$fitness_effect,
+    complementation = gene_params$complementation,
+    input_counts    = input_counts,
+    output_counts   = output_counts,
+    log2_ratio      = log2_ratio,
+    fitness_score   = log2_ratio_norm
+  )
+
+  list(results = results, output_freq = output_freq)
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. TWO-ROUND EXPERIMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+#' Run the full two-round experiment for one Round 1 MOI value.
+#'
+#' Round 1: standard co-infection at moi_r1
+#' Round 2: each phage infects alone — effective MOI forced to ~0
+#'          (implemented as moi = 0.01 so cells receive at most 1 phage
+#'           with very high probability; Poisson(0.01) gives P(≥2) < 0.005%)
+#'
+#' @param moi_r1      MOI for Round 1
+#' @param moi_r2      MOI for Round 2 (default 0.01 ≈ single infection)
+#' @param n_bacteria  Bacteria per round
+#' @param burst_size  WT burst size
+#' @param gene_params Gene parameter tibble
+#' @param seed        Base random seed
+#' @return Tibble with per-gene scores for both rounds and delta
+
+two_round_experiment <- function(moi_r1      = 1,
+                                 moi_r2      = 0.01,
+                                 n_bacteria  = 2e5,
+                                 burst_size  = 50,
+                                 gene_params = gene_params,
+                                 seed        = 99) {
+
+  # Round 1 — co-infection, uniform input library
+  r1 <- run_infection_round(
+    moi        = moi_r1,
+    n_bacteria = n_bacteria,
+    burst_size = burst_size,
+    gene_params= gene_params,
+    input_freq = NULL,
+    seed       = seed
+  )
+
+  # Round 2 — single infection, input frequencies from Round 1 output
+  r2 <- run_infection_round(
+    moi        = moi_r2,
+    n_bacteria = n_bacteria,
+    burst_size = burst_size,
+    gene_params= gene_params,
+    input_freq = r1$output_freq,
+    seed       = seed + 1
+  )
+
+  # Combine and compute delta
+  r1$results %>%
+    select(gene_id, stage, true_fitness, complementation,
+           fitness_score_r1 = fitness_score) %>%
+    left_join(
+      r2$results %>% select(gene_id, fitness_score_r2 = fitness_score),
+      by = "gene_id"
+    ) %>%
+    mutate(
+      delta       = fitness_score_r2 - fitness_score_r1,
+      moi_r1      = moi_r1,
+      moi_r2      = moi_r2
+    )
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. RUN ACROSS MULTIPLE ROUND 1 MOIs
+# ─────────────────────────────────────────────────────────────────────────────
+
+moi_r1_values <- c(0.1, 0.5, 1, 2, 5, 10)
+
+cat("\nRunning two-round experiments across Round 1 MOIs...\n")
+
+results_all <- map_dfr(moi_r1_values, function(m) {
+  cat("  Round 1 MOI =", m, "\n")
+  two_round_experiment(
+    moi_r1     = m,
+    moi_r2     = 0.01,
+    n_bacteria = 2e5,
+    burst_size = 50,
+    gene_params= gene_params,
+    seed       = 99
+  )
+})
+
+# Add classification labels
+results_all <- results_all %>%
+  mutate(
+    essentiality = case_when(
+      true_fitness < 0.1  ~ "Essential",
+      true_fitness < 0.6  ~ "Moderate",
+      TRUE                ~ "Near-neutral"
+    ),
+    stage = factor(stage, levels = c("adsorption", "replication", "exit"))
+  )
+
+stage_colors <- c(adsorption  = "#e41a1c",
+                  replication = "#377eb8",
+                  exit        = "#4daf4a")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. VISUALIZATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Plot 1: Round 1 vs Round 2 fitness scores, essential genes only ───────────
+# Shows the "unmasking" of complemented mutants in Round 2
+p1 <- results_all %>%
+  filter(essentiality == "Essential") %>%
+  pivot_longer(cols = c(fitness_score_r1, fitness_score_r2),
+               names_to = "round",
+               values_to = "fitness_score") %>%
+  mutate(round = recode(round,
+                        fitness_score_r1 = "Round 1 (co-infection)",
+                        fitness_score_r2 = "Round 2 (single infection)")) %>%
+  ggplot(aes(x = round, y = fitness_score,
+             color = stage, group = gene_id)) +
+  geom_line(alpha = 0.5, linewidth = 0.6) +
+  geom_point(alpha = 0.8, size = 1.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_grid(stage ~ factor(moi_r1, labels = paste0("R1 MOI=", moi_r1_values))) +
+  scale_color_manual(values = stage_colors) +
+  labs(
+    title    = "Essential Gene Fitness: Round 1 (co-infection) vs Round 2 (single infection)",
+    subtitle = "Replication/exit mutants rescued in Round 1 crash in Round 2; adsorption mutants unchanged",
+    x        = NULL,
+    y        = "Normalized fitness score",
+    color    = "Stage"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x  = element_text(angle = 25, hjust = 1),
+        legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 8))
+
+print(p1)
+ggsave("tnseq_v3_round1_vs_round2_essential.pdf", p1, width = 13, height = 9)
+
+
+# ── Plot 2: Delta score (R2 - R1) by stage and complementation ───────────────
+# The delta is the complementation mask: negative = was being rescued in R1
+p2 <- results_all %>%
+  # filter(essentiality != "Near-neutral") %>%
+  ggplot(aes(x = factor(moi_r1), y = delta,
+             color = complementation, group = gene_id)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_line(alpha = 0.4, linewidth = 0.5) +
+  geom_point(alpha = 0.8, size = 1.8) +
+  facet_grid(essentiality ~ stage) +
+  scale_color_viridis_c(name = "Complementation\nFraction", option = "plasma") +
+  labs(
+    title    = "Delta Score (Round 2 − Round 1) by Stage and Essentiality",
+    subtitle = "Negative delta = gene was complemented/rescued in Round 1; adsorption genes cluster near zero",
+    x        = "Round 1 MOI",
+    y        = "Delta fitness score (R2 − R1)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+
+print(p2)
+ggsave("tnseq_v3_delta_by_stage.pdf", p2, width = 12, height = 7)
+
+
+# ── Plot 3: Delta vs complementation fraction — the core diagnostic plot ──────
+# At high R1 MOI, delta should correlate strongly with complementation
+# for replication/exit genes; adsorption genes should be flat near zero
+p3 <- results_all %>%
+  filter(essentiality == "Essential",
+         moi_r1 %in% c(0.1, 1, 5, 10)) %>%
+  mutate(moi_label = paste0("R1 MOI = ", moi_r1)) %>%
+  ggplot(aes(x = complementation, y = delta, color = stage, shape = stage)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8,
+              aes(group = stage), alpha = 0.15) +
+  facet_wrap(~moi_label, nrow = 1) +
+  scale_color_manual(values = stage_colors) +
+  scale_shape_manual(values = c(adsorption = 17, replication = 16, exit = 15)) +
+  labs(
+    title    = "Delta Score vs Complementation Fraction — Essential Genes",
+    subtitle = "Strong negative correlation for replication/exit at high MOI; adsorption genes flat",
+    x        = "Complementation fraction",
+    y        = "Delta fitness score (R2 − R1)",
+    color    = "Stage", shape = "Stage"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom")
+
+print(p3)
+ggsave("tnseq_v3_delta_vs_complementation.pdf", p3, width = 13, height = 5)
+
+
+# ── Plot 4: Population structure — input vs output frequencies across rounds ──
+# Shows how the phage population shifts: complemented mutants inflate in R1,
+# then are purged in R2
+freq_data <- map_dfr(moi_r1_values, function(m) {
+
+  r1 <- run_infection_round(
+    moi = m, n_bacteria = 2e5, burst_size = 50,
+    gene_params = gene_params, input_freq = NULL, seed = 99
+  )
+  r2 <- run_infection_round(
+    moi = 0.01, n_bacteria = 2e5, burst_size = 50,
+    gene_params = gene_params, input_freq = r1$output_freq, seed = 100
+  )
+
+  tibble(
+    gene_id      = gene_params$gene_id,
+    stage        = gene_params$stage,
+    true_fitness = gene_params$fitness_effect,
+    complementation = gene_params$complementation,
+    freq_input   = rep(1 / n_genes, n_genes),
+    freq_r1_out  = r1$output_freq,
+    freq_r2_out  = r2$output_freq,
+    moi_r1       = m
+  )
+}) %>%
+  mutate(
+    enrichment_r1 = log2(freq_r1_out / freq_input),
+    enrichment_r2 = log2(freq_r2_out / freq_r1_out),
+    essentiality  = case_when(
+      true_fitness < 0.1  ~ "Essential",
+      true_fitness < 0.6  ~ "Moderate",
+      TRUE                ~ "Near-neutral"
+    ),
+    stage = factor(stage, levels = c("adsorption", "replication", "exit"))
+  )
+
+p4 <- freq_data %>%
+  filter(essentiality == "Essential", moi_r1 %in% c(1, 5, 10)) %>%
+  ggplot(aes(x = enrichment_r1, y = enrichment_r2,
+             color = complementation, shape = stage)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(size = 3, alpha = 0.9) +
+  facet_wrap(~paste0("R1 MOI = ", moi_r1), nrow = 1) +
+  scale_color_viridis_c(name = "Complementation", option = "plasma") +
+  scale_shape_manual(values = c(adsorption = 17, replication = 16, exit = 15)) +
+  labs(
+    title    = "Population Structure: Round 1 Enrichment vs Round 2 Purging",
+    subtitle = "Top-left = rescued in R1, purged in R2 (high complementation replication/exit genes)\nBottom-left = essential regardless (adsorption, or low complementation)",
+    x        = "log2 enrichment in Round 1 output vs input",
+    y        = "log2 enrichment in Round 2 output vs R1 output",
+    shape    = "Stage"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "right")
+
+print(p4)
+ggsave("tnseq_v3_population_structure.pdf", p4, width = 13, height = 5)
+
+
+# ── Plot 5: Heatmap — delta scores for all genes across all R1 MOIs ───────────
+heat_data <- results_all %>%
+  arrange(stage, true_fitness) %>%
+  mutate(gene_id = factor(gene_id, levels = unique(gene_id)))
+
+p5 <- ggplot(heat_data, aes(x = factor(moi_r1), y = gene_id, fill = delta)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  scale_fill_gradient2(low = "#d73027", mid = "white", high = "#1a9641",
+                       midpoint = 0, name = "Delta\n(R2−R1)") +
+  facet_grid(stage ~ ., scales = "free_y", space = "free") +
+  labs(
+    title    = "Delta Fitness Score (R2 − R1) Heatmap",
+    subtitle = "Red = gene was rescued in R1, exposed in R2 | Sorted by true fitness within stage",
+    x        = "Round 1 MOI",
+    y        = "Gene"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    axis.text.y      = element_text(size = 5),
+    strip.text.y     = element_text(angle = 0, face = "bold"),
+    legend.position  = "right"
+  )
+
+print(p5)
+ggsave("tnseq_v3_delta_heatmap.pdf", p5, width = 9, height = 14)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. SUMMARY STATISTICS
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("\n══════════════════════════════════════════════════════════════════\n")
+cat("Mean delta score (R2 − R1) for ESSENTIAL genes by stage and MOI\n")
+cat("══════════════════════════════════════════════════════════════════\n")
+cat("Negative delta = gene was being rescued by complementation in R1\n\n")
+
+results_all %>%
+  filter(essentiality == "Essential") %>%
+  group_by(moi_r1, stage) %>%
+  summarise(mean_delta = round(mean(delta), 3),
+            sd_delta   = round(sd(delta),   3),
+            .groups    = "drop") %>%
+  pivot_wider(names_from = stage, values_from = c(mean_delta, sd_delta)) %>%
+  print()
+
+cat("\n══════════════════════════════════════════════════════════════════\n")
+cat("Correlation: complementation fraction vs delta score\n")
+cat("(essential genes only; tests if delta reveals complementation)\n")
+cat("══════════════════════════════════════════════════════════════════\n")
+
+results_all %>%
+  filter(essentiality == "Essential") %>%
+  group_by(moi_r1, stage) %>%
+  summarise(
+    r_comp_delta = round(cor(complementation, delta, method = "pearson"), 3),
+    .groups      = "drop"
+  ) %>%
+  pivot_wider(names_from = stage, values_from = r_comp_delta) %>%
+  print()
+```
+
+
+
